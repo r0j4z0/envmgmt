@@ -1,0 +1,313 @@
+#!/bin/bash
+set +x
+
+total_vars=(ANSIBLE_VAULT_PASSWORD_FILE ANSIBLE_LOG_PATH ANSIBLE_ROLES_PATH ANSIBLE_LIBRARY ANSIBLE_INVENTORY ANSIBLE_PRIVATE_KEY_FILE ANSIBLE_FILTER_PLUGINS ANSIBLE_HASH_BEHAVIOUR ANSIBLE_CONFIG ANSIBLE_REMOTE_USER mrt_env ENVIRONMENT ANSIBLE_SSH_ARGS ANSIBLE_CALLBACK_PLUGINS MRT_CLUSTER_CONFIG keyfile)
+
+
+for var in ${total_vars[@]}
+do
+    unset $var
+done
+env_skel=(vars logs ssh inventories group_vars)
+mrt_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+default_ansible_ssh_args="-o ControlPersist=60s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"
+
+unset ${total_vars[@]}
+
+function check_folder {
+
+    if [ ! -d $1 ]; then return 1;else return 0; fi
+
+}
+
+function check_folder_empty {
+
+    if check_folder $1; then
+        if [ $(ls -1 $1 | wc -l) -gt 0 ]; then
+            return 0
+        else
+            return 1
+        fi
+    else
+        return 2
+    fi
+
+}
+
+function check_role_path {
+
+    local -a ROLEPATH=(${!1})
+
+    for path in ${ROLEPATH[@]}
+    do
+        if check_folder_empty $path ; then
+            if [ -n "$final_role_path" ]; then
+                final_role_path=${final_role_path}:$path
+            else
+                final_role_path=$path
+            fi
+        fi
+    done
+
+}
+
+function check_env {
+
+
+    local name=$1
+    local basepath=${2:-${mrt_dir}/environments}
+    local envtype=${3:-ost}
+
+    find ${mrt_dir}/environment_skel/ | grep -v ".*environment_skel/$" | while read file
+    do
+        if [ ! -e ${basepath}/${name}/$(basename "${file}") ]; then
+            echo "Warning ${basepath}/${name}/$(basename ${file}) not found"
+        fi
+    done
+
+
+}
+
+function create_env {
+
+    local name=$1
+    local basepath=${2:-${mrt_dir}/environments}
+    local envtype=${3:-ost}
+
+    if check_folder ${basepath}/${name} ; then
+        echo "Environment ${name} already exists on ${basepath} aborting"
+        return 1
+    fi
+
+    mkdir -p ${basepath}
+
+    cp -r ${mrt_dir}/environment_skel ${basepath}/${name} 2>&1 > /dev/null
+
+    if [ $? -ne 0 ]; then
+        echo "Problem creating environment"
+        return 1
+    fi
+
+    touch ${basepath}/${name}/vars/common.yaml
+    touch ${basepath}/${name}/inventories/inventory
+    return 0
+
+}
+
+function switch_env {
+
+    local name=$1
+    local basepath=${2:-${mrt_dir}/environments}
+    local rolespath=${3:-${mrt_dir}/roles}
+    local remoteuser=${4:-ec2-user}
+    local logpath=${5:-/tmp/ansible.log}
+    local ansible_ssh_args=$6
+    local envtype=${7:-ost}
+    local vaultpass="${8}"
+
+    if [ ! -d ${basepath}/${name} ]; then
+        echo "Environment ${name} doesn't exists on ${basepath}"
+        return 1
+    fi
+
+    if [ -d ${mrt_dir}/.venv ]; then
+        source ${mrt_dir}/.venv/bin/activate
+    else
+        echo "Mr-t not installed please run ${mrt_dir}/install.sh before proceed."
+        return 1
+    fi
+
+    echo -e
+    echo "Environment: $name"
+    echo -e
+    echo "Environment path: ${basepath}/${name}"
+    check_env ${name} ${basepath} ${envtype}
+    echo -e
+    echo "Ansible roles path/s: $rolespath"
+    echo "Ansible log file: ${logpath}"
+    if [ -n "${vaultpass}" ]; then
+        echo "Ansible vault pass defined!"
+        touch ${basepath}/${name}/.vaultpass
+        chmod 600 ${basepath}/${name}/.vaultpass
+        echo "$vaultpass" > ${basepath}/${name}/.vaultpass
+        export ANSIBLE_VAULT_PASSWORD_FILE="${basepath}/${name}/.vaultpass"
+    else
+        \rm ${basepath}/${name}/.vaultpass 2>&1 /dev/null
+    fi
+    echo -e
+    echo "Connectivity:"
+    echo -e
+    echo "Remote username: ${remoteuser}"
+    echo "SSH key file: ${keyfile}"
+
+    if [ "$ansible_ssh_args" != "$default_ansible_ssh_args" ]; then
+        echo "Jumpbox: \"$(echo $ansible_ssh_args|awk '{print $(NF)}')"
+    fi
+    echo -e
+
+    export ANSIBLE_SSH_ARGS=$ansible_ssh_args
+    export ANSIBLE_LOG_PATH=${logpath}
+    export ANSIBLE_HASH_BEHAVIOUR=merge
+    export ANSIBLE_ROLES_PATH=${rolespath}
+    export ANSIBLE_LIBRARY=${mrt_dir}/modules
+    export ANSIBLE_INVENTORY=${basepath}/${name}/inventories
+    export ANSIBLE_PRIVATE_KEY_FILE=${keyfile}
+    export ANSIBLE_FILTER_PLUGINS=${mrt_dir}/filter_plugins
+    export ANSIBLE_CONFIG=${mrt_dir}/ansible.cfg
+    export ANSIBLE_REMOTE_USER=${remoteuser}
+    export ANSIBLE_CALLBACK_PLUGINS=${mrt_dir}/callback_plugins
+    export ENVIRONMENT=${name}
+    export mrt_env=${basepath}/${name}
+
+    echo "Created alias:"
+    echo -e
+    echo "shinv -> show inventory"
+    echo "cdenv -> cd to environment folder"
+    echo "cdmrt -> cd to mr-t folder"
+    echo "getroles -> run ansible-galaxy to download the required roles"
+
+    alias shinv="cat $mrt_env/inventories/inventory"
+
+    alias cdenv="cd $mrt_env"
+    alias cdmrt="cd $mrt_dir"
+
+    alias getroles="ansible-galaxy install -r ${basepath}/${name}/roles_requirements.yml"
+
+    if [ -d ${mrt_dir}/.venv ]; then
+        source ${mrt_dir}/.venv/bin/activate
+    else
+        echo "Mr-t not installed please run ${mrt_dir}/install.sh before proceed."
+        return 1
+    fi
+
+    export PS1=$(echo "$PS1" | sed "s/^\(\[.*\]\)*/\[${ENVIRONMENT}\]/g")
+}
+
+function usage {
+
+    cat <<EOF
+
+usage: source mrt-env [ -c|--create ] [ -b|--envbasepath path ] [ -r|--rolespath path ] [ -u|--remoteuser username } [ -k|--keyfile ssh_key_file ] 
+                      [ -v|--vaultpass xxxxx ] [ -l|--logfile logfile ] [-j|--jumpbox ip:port ] [ -m|--jumpboxuser username ] [ -n|--jumpboxpem file ]
+                      env_name
+
+    Options:
+
+    -c|--create : Create a empty environment skel on ENVBASEPATH/env_name.
+    -b|--envbasepath ~/deploy/c4/environments/pro : Specifies the folder containing environments configurations, if not defined mrt-env will try to use ./environments folder.
+    -r|--rolespath ~/deploy/c4/environments/pro/roles : Specifies the location where the required roles will be downloades, if not specified we will create a "roles" folder inside the environment.
+    -u|--remoteuser monitorizacion : Specifies what remote user will use to connect to machines on that environment, if not defined we will use monitorizacion.
+    -k|--keyfile ~/.ssh/id_rsa : Specifies what ssh key file will use to connect to machines on desired environment, if not defined will try to use ~/.ssh/id_rsa.
+    -v|--vaultpass xxxxxxx : Specifies the ansible vault password we will use to decrypt files.
+    -l|--logfile /tmp/ansible.log : Specifies where we want to store the ansible logs file, by default they will stored on /tmp/ansible_ENV_NAME.log
+    -j|--jumpbox 192.168.50.10:2222 : Specifies a machine to use as a jumpbox to reach the systems.
+    -m|--jumpboxuser ec2-user : Specifies a user to connect to the jumpbox.
+    -n|--jumpboxpem jsmsup.pem : Specifies the pem file to use to connect to jumpbox.
+
+
+EOF
+
+
+}
+
+
+while true
+do
+
+    case "$1"
+    in
+        -h|--help)
+            usage;
+            return;
+            ;;
+        -b|--envbasepath)
+            env_path=${2%/}
+            shift 2;
+            ;;
+        -r|--rolespath)
+            roles_path="$2"
+            shift 2;
+            ;;
+        -c|--create)
+            create=1
+            shift 1;
+            ;;
+        -u|--remoteuser)
+            remote_user=$2
+            shift 2;
+            ;;
+        -k|--keyfile)
+            keyfile=$2
+            shift 2;
+            ;;
+        -v|--vaultpass)
+            vaultpass=$2
+            shift 2;
+            ;;
+        -l|--logpath)
+            log_path=$2
+            shift 2;
+            ;;
+        -j|--jumpbox)
+            jumpbox=$2
+            shift 2;
+            ;;
+        -m|--jumpboxuser)
+            jumpboxuser=$2
+            shift 2;
+            ;;
+        -n|--jumpboxpem)
+            jumpboxpem=$2
+            shift 2;
+            ;;
+        "")
+            break;
+            ;;
+
+        *)
+           env_name=$1
+           shift 1;
+
+    esac
+done
+if [ ! -n "$env_name" ]; then echo "ERROR: environment name needed."; usage; return 1; fi
+if [ ! -n "$env_type" ]; then env_type="vmw"; fi
+if [ ! -n "$env_path" ]; then env_path=${mrt_dir}/environments; fi
+if [ ! -n "$roles_path" ]; then roles_path=${env_path}/${env_name}/roles; fi
+if [ ! -n "$remote_user" ]; then remote_user=monitorizacion; fi
+if [ ! -n "$log_path" ]; then log_path=/tmp/ansible_${env_name}.log; fi
+if [ ! -n "$keyfile" ]; then keyfile="~/.ssh/id_rsa"; fi 
+if [ -n "$jumpbox" ]; then
+    temp_ansible_ssh_args="${default_ansible_ssh_args} -o ProxyCommand=\"ssh -W %h:%p ${jumpboxpem} ${jumpboxuser:-$remote_user}@${jumpbox}\""
+fi
+
+if [ -n "$create" ]; then
+    if ! create_env $env_name $env_path $env_type; then
+        return
+    fi
+fi
+
+if [ -n "$env_path" ]; then
+    if [ -n "$roles_path" ]; then
+        if [ ! -d "${roles_path}" ]; then
+            mkdir -p ${roles_path}
+        fi
+    fi
+fi
+
+if [ -n "$env_name" ]; then switch_env $env_name $env_path $roles_path $remote_user "${log_path}" "${temp_ansible_ssh_args:-$default_ansible_ssh_args}" "$env_type" "$vaultpass"; fi
+
+unset create
+unset env_name
+unset env_type
+unset env_path
+unset roles_path
+unset final_role_path
+unset remote_user
+unset log_path
+unset default_ansible_ssh_args
+unset jumpbox
+unset temp_ansible_ssh_args
+unset vaultpass
+set +x
