@@ -1,13 +1,22 @@
 #!/bin/bash
 set +x
 
-total_vars=(ANSIBLE_VAULT_PASSWORD_FILE ANSIBLE_LOG_PATH ANSIBLE_ROLES_PATH ANSIBLE_LIBRARY ANSIBLE_INVENTORY ANSIBLE_PRIVATE_KEY_FILE ANSIBLE_FILTER_PLUGINS ANSIBLE_HASH_BEHAVIOUR ANSIBLE_CONFIG ANSIBLE_REMOTE_USER mrt_env ENVIRONMENT ANSIBLE_SSH_ARGS ANSIBLE_CALLBACK_PLUGINS MRT_CLUSTER_CONFIG keyfile)
+total_vars=(ANSIBLE_RETRY_FILES_ENABLED ANSIBLE_VAULT_PASSWORD_FILE ANSIBLE_LOG_PATH ANSIBLE_ROLES_PATH ANSIBLE_LIBRARY ANSIBLE_INVENTORY ANSIBLE_PRIVATE_KEY_FILE ANSIBLE_FILTER_PLUGINS ANSIBLE_HASH_BEHAVIOUR ANSIBLE_CONFIG ANSIBLE_REMOTE_USER mrt_env ENVIRONMENT ANSIBLE_SSH_ARGS ANSIBLE_CALLBACK_PLUGINS MRT_CLUSTER_CONFIG keyfile)
+
+function clean {
+
+    for var in ${total_vars[@]}
+    do
+        unset $var
+    done
+
+    unset ${total_vars[@]}
+
+}
 
 
-for var in ${total_vars[@]}
-do
-    unset $var
-done
+clean
+
 env_skel=(vars logs ssh inventories group_vars)
 mrt_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
@@ -114,7 +123,7 @@ function switch_env {
     if [ -d ${mrt_dir}/.venv ]; then
         source ${mrt_dir}/.venv/bin/activate
     else
-        echo "Mr-t not installed please run ${mrt_dir}/install.sh before proceed."
+        echo "Environment Management not installed, please run ${mrt_dir}/install.sh before proceed."
         return 1
     fi
 
@@ -133,8 +142,19 @@ function switch_env {
         echo "$vaultpass" > ${basepath}/${name}/.vaultpass
         export ANSIBLE_VAULT_PASSWORD_FILE="${basepath}/${name}/.vaultpass"
     else
-        \rm ${basepath}/${name}/.vaultpass 2>&1 /dev/null
+        rm -f ${basepath}/${name}/.vaultpass 2>&1 > /dev/null
     fi
+
+    for varfile in $(find ${basepath}/${name}/vars/ ${basepath}/${name}/group_vars/ -type f)
+    do
+        if [[ "$(head -1 ${varfile})" =~ ^\$ANSIBLE_VAULT ]]; then
+            if [[ ! -v ANSIBLE_VAULT_PASSWORD_FILE ]]; then
+                echo "Some variable files are encrypted with Ansible Vault but you don't specified the ansible vault password flag (-v). Aborting."
+                return 1
+            fi
+        fi
+    done
+
     echo -e
     echo "Connectivity:"
     echo -e
@@ -146,6 +166,7 @@ function switch_env {
     fi
     echo -e
 
+    export ANSIBLE_RETRY_FILES_ENABLED=False
     export ANSIBLE_SSH_ARGS=$ansible_ssh_args
     export ANSIBLE_LOG_PATH=${logpath}
     export ANSIBLE_HASH_BEHAVIOUR=merge
@@ -164,20 +185,20 @@ function switch_env {
     echo -e
     echo "shinv -> show inventory"
     echo "cdenv -> cd to environment folder"
-    echo "cdmrt -> cd to mr-t folder"
+    echo "cdmng -> cd to mr-t folder"
     echo "getroles -> run ansible-galaxy to download the required roles"
 
     alias shinv="cat $mrt_env/inventories/inventory"
 
     alias cdenv="cd $mrt_env"
-    alias cdmrt="cd $mrt_dir"
+    alias cdmng="cd $mrt_dir"
 
-    alias getroles="ansible-galaxy install -r ${basepath}/${name}/roles_requirements.yml"
+    alias getroles="ansible-galaxy install -r ${basepath}/${name}/roles_requirements.yml --force"
 
     if [ -d ${mrt_dir}/.venv ]; then
         source ${mrt_dir}/.venv/bin/activate
     else
-        echo "Mr-t not installed please run ${mrt_dir}/install.sh before proceed."
+        echo "Environment Management not installed please run ${mrt_dir}/install.sh before proceed."
         return 1
     fi
 
@@ -188,14 +209,14 @@ function usage {
 
     cat <<EOF
 
-usage: source mrt-env [ -c|--create ] [ -b|--envbasepath path ] [ -r|--rolespath path ] [ -u|--remoteuser username } [ -k|--keyfile ssh_key_file ] 
+usage: source $(basename $BASH_SOURCE) [ -c|--create ] [ -b|--envbasepath path ] [ -r|--rolespath path ] [ -u|--remoteuser username } [ -k|--keyfile ssh_key_file ] 
                       [ -v|--vaultpass xxxxx ] [ -l|--logfile logfile ] [-j|--jumpbox ip:port ] [ -m|--jumpboxuser username ] [ -n|--jumpboxpem file ]
                       env_name
 
     Options:
 
     -c|--create : Create a empty environment skel on ENVBASEPATH/env_name.
-    -b|--envbasepath ~/deploy/c4/environments/pro : Specifies the folder containing environments configurations, if not defined mrt-env will try to use ./environments folder.
+    -b|--envbasepath ~/deploy/c4/environments/pro : Specifies the folder containing environments configurations, if not defined $(basename $BASH_SOURCE) will try to use ./environments folder.
     -r|--rolespath ~/deploy/c4/environments/pro/roles : Specifies the location where the required roles will be downloades, if not specified we will create a "roles" folder inside the environment.
     -u|--remoteuser monitorizacion : Specifies what remote user will use to connect to machines on that environment, if not defined we will use monitorizacion.
     -k|--keyfile ~/.ssh/id_rsa : Specifies what ssh key file will use to connect to machines on desired environment, if not defined will try to use ~/.ssh/id_rsa.
@@ -296,7 +317,14 @@ if [ -n "$env_path" ]; then
     fi
 fi
 
-if [ -n "$env_name" ]; then switch_env $env_name $env_path $roles_path $remote_user "${log_path}" "${temp_ansible_ssh_args:-$default_ansible_ssh_args}" "$env_type" "$vaultpass"; fi
+if [ -n "$env_name" ]; then 
+    switch_env $env_name $env_path $roles_path $remote_user "${log_path}" "${temp_ansible_ssh_args:-$default_ansible_ssh_args}" "$env_type" "$vaultpass"
+    if [[ $? == 1 ]]; then
+        clean
+        deactivate
+	echo post clean
+    fi
+fi
 
 unset create
 unset env_name
